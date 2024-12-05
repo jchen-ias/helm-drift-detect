@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"github.com/fluxcd/pkg/ssa/jsondiff"
@@ -41,6 +42,7 @@ func (l *LogrusAdapter) Fatalf(format string, args ...interface{}) {
 }
 
 type HelmClient interface {
+	GetHelmRelease(ctx context.Context, name, namespace string) (*v2.HelmRelease, error)
 	GetRelease(name string) (*helmrelease.Release, error)
 	DiffRelease(ctx context.Context, release *helmrelease.Release, controller string, ignoreRules []v2.IgnoreRule) (jsondiff.DiffSet, error)
 }
@@ -110,6 +112,25 @@ func (hc *HelmActionClient) findReleaseStorageNamespace(releaseName string) (str
 	return "", fmt.Errorf("helm release storage not found for release %s in any namespace", releaseName)
 }
 
+func (hc *HelmActionClient) GetHelmRelease(ctx context.Context, name, namespace string) (*v2.HelmRelease, error) {
+	raw, err := hc.client.RESTClient().Get().
+		AbsPath("/apis/helm.toolkit.fluxcd.io/v2").
+		Namespace(namespace).
+		Resource("helmreleases").
+		Name(name).
+		DoRaw(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get HelmRelease %s/%s: %w", namespace, name, err)
+	}
+
+	var helmRelease v2.HelmRelease
+	if err := json.Unmarshal(raw, &helmRelease); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal HelmRelease: %w", err)
+	}
+
+	return &helmRelease, nil
+}
+
 func (hc *HelmActionClient) GetRelease(name string) (*helmrelease.Release, error) {
 	if err := hc.getActionConfig(name); err != nil {
 		return nil, fmt.Errorf("failed to initialize action configuration: %w", err)
@@ -144,7 +165,17 @@ func (h *HelmDriftDetect) Run(ctx context.Context, releaseName, namespace string
 		return fmt.Errorf("failed to get Helm release %s: %w", releaseName, err)
 	}
 
-	diffSet, err := h.HelmClient.DiffRelease(ctx, release, "helm-controller", []v2.IgnoreRule{})
+	helmRelease, err := h.HelmClient.GetHelmRelease(ctx, releaseName, namespace)
+	if err != nil {
+		return fmt.Errorf("failed to get HelmRelease %s/%s: %w", namespace, releaseName, err)
+	}
+
+	var ignoreRules []v2.IgnoreRule
+	if helmRelease.Spec.DriftDetection != nil {
+		ignoreRules = helmRelease.Spec.DriftDetection.Ignore
+	}
+
+	diffSet, err := h.HelmClient.DiffRelease(ctx, release, "helm-controller", ignoreRules)
 	if err != nil {
 		return fmt.Errorf("failed to detect drift: %w", err)
 	}
