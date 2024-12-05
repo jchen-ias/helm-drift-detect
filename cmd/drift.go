@@ -5,7 +5,12 @@ import (
 	"flag"
 	"fmt"
 	"github.com/fluxcd/pkg/ssa/jsondiff"
+	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
 	"os"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	"strings"
 
 	helmaction "helm.sh/helm/v3/pkg/action"
 	helmrelease "helm.sh/helm/v3/pkg/release"
@@ -41,26 +46,75 @@ type HelmClient interface {
 }
 
 type HelmActionClient struct {
+	logger       Logger
+	settings     *genericclioptions.ConfigFlags
+	client       *kubernetes.Clientset
 	actionConfig *helmaction.Configuration
 }
 
-func NewHelmActionClient(namespace string, logger func(string, ...interface{})) (HelmClient, error) {
-	settings := genericclioptions.NewConfigFlags(true)
-	settings.Namespace = &namespace
-
-	actionConfig := new(helmaction.Configuration)
-	if err := actionConfig.Init(settings, namespace, os.Getenv("HELM_DRIVER"), logger); err != nil {
-		return nil, err
+func NewHelmActionClient(settings *genericclioptions.ConfigFlags, logger Logger) (HelmClient, error) {
+	config, err := settings.ToRESTConfig()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get kubernetes config: %w", err)
 	}
 
+	client, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create kubernetes client: %w", err)
+	}
 	return &HelmActionClient{
-		actionConfig: actionConfig,
+		logger:   logger,
+		settings: settings,
+		client:   client,
 	}, nil
 }
 
+func (hc *HelmActionClient) getActionConfig(releaseName string) error {
+	if hc.actionConfig != nil {
+		return nil
+	}
+
+	storageNamespace, err := hc.findReleaseStorageNamespace(releaseName)
+	if err != nil {
+		return err
+	}
+
+	hc.actionConfig = new(helmaction.Configuration)
+	if err := hc.actionConfig.Init(hc.settings, storageNamespace, os.Getenv("HELM_DRIVER"), hc.logger.Infof); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (hc *HelmActionClient) findReleaseStorageNamespace(releaseName string) (string, error) {
+	namespaces, err := hc.client.CoreV1().Namespaces().List(context.Background(), v1.ListOptions{})
+	if err != nil {
+		return "", fmt.Errorf("failed to list namespaces: %w", err)
+	}
+
+	secretName := fmt.Sprintf("sh.helm.release.v1.%s.v", releaseName)
+
+	for _, ns := range namespaces.Items {
+		secrets, err := hc.client.CoreV1().Secrets(ns.Name).List(context.Background(), v1.ListOptions{})
+		if err != nil {
+			return "", fmt.Errorf("failed to list secrets in namespace %s: %w", ns.Name, err)
+		}
+		for _, secret := range secrets.Items {
+			if strings.HasPrefix(secret.Name, secretName) {
+				return ns.Name, nil
+			}
+		}
+	}
+
+	return "", fmt.Errorf("helm release storage not found for release %s in any namespace", releaseName)
+}
+
 func (hc *HelmActionClient) GetRelease(name string) (*helmrelease.Release, error) {
-	getter := helmaction.NewGet(hc.actionConfig)
-	return getter.Run(name)
+	if err := hc.getActionConfig(name); err != nil {
+		return nil, fmt.Errorf("failed to initialize action configuration: %w", err)
+	}
+	return action.LastRelease(hc.actionConfig, name)
 }
 
 func (hc *HelmActionClient) DiffRelease(ctx context.Context, release *helmrelease.Release, controller string, ignoreRules []v2.IgnoreRule) (jsondiff.DiffSet, error) {
@@ -87,7 +141,7 @@ func (h *HelmDriftDetect) Run(ctx context.Context, releaseName, namespace string
 
 	release, err := h.HelmClient.GetRelease(releaseName)
 	if err != nil {
-		return fmt.Errorf("failed to get HelmRelease %s: %w", releaseName, err)
+		return fmt.Errorf("failed to get Helm release %s: %w", releaseName, err)
 	}
 
 	diffSet, err := h.HelmClient.DiffRelease(ctx, release, "helm-controller", []v2.IgnoreRule{})
@@ -127,6 +181,9 @@ func main() {
 	logger := &LogrusAdapter{}
 	log.SetFormatter(logger)
 
+	ctrlLogger := zap.New(zap.UseDevMode(true))
+	ctrl.SetLogger(ctrlLogger)
+
 	var namespace, releaseName string
 	flag.StringVar(&namespace, "n", "", "namespace of the HelmRelease")
 	flag.StringVar(&releaseName, "r", "", "name of the HelmRelease")
@@ -139,8 +196,8 @@ func main() {
 	if namespace == "" {
 		namespace = "default"
 	}
-
-	helmClient, err := NewHelmActionClient(namespace, log.Infof)
+	settings := genericclioptions.NewConfigFlags(true)
+	helmClient, err := NewHelmActionClient(settings, logger)
 	if err != nil {
 		logger.Fatalf("Failed to initialize Helm client: %v\n", err)
 	}
