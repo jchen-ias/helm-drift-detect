@@ -6,10 +6,6 @@ Helm Drift Detect is a tool designed to detect drifts in Helm releases. It provi
 
 - This script uses internal modules of the `helm-controller`, so it must be compiled within the `helm-controller` project.
 
-## Note
-
-- For simplicity, the script does not consider the ignore rules defined in `HelmRelease`. As a result, it outputs all detected drifts, including some that might otherwise be ignored.
-
 ## Usage
 
 To use this tool, follow these steps:
