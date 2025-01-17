@@ -160,14 +160,16 @@ func (h *HelmDriftDetect) Run(ctx context.Context, releaseName, namespace string
 		newline = "\n"
 	)
 
-	release, err := h.HelmClient.GetRelease(releaseName)
-	if err != nil {
-		return fmt.Errorf("failed to get Helm release %s: %w", releaseName, err)
-	}
-
 	helmRelease, err := h.HelmClient.GetHelmRelease(ctx, releaseName, namespace)
 	if err != nil {
 		return fmt.Errorf("failed to get HelmRelease %s/%s: %w", namespace, releaseName, err)
+	}
+       
+        releaseName = helmRelease.Spec.ReleaseName
+
+	release, err := h.HelmClient.GetRelease(releaseName)
+	if err != nil {
+		return fmt.Errorf("failed to get Helm release %s: %w", releaseName, err)
 	}
 
 	var ignoreRules []v2.IgnoreRule
