@@ -6,16 +6,13 @@ import (
 	"flag"
 	"fmt"
 	"github.com/fluxcd/pkg/ssa/jsondiff"
-	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	helmaction "helm.sh/helm/v3/pkg/action"
+	helmrelease "helm.sh/helm/v3/pkg/release"
+	"k8s.io/cli-runtime/pkg/genericclioptions"
 	"k8s.io/client-go/kubernetes"
 	"os"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
-	"strings"
-
-	helmaction "helm.sh/helm/v3/pkg/action"
-	helmrelease "helm.sh/helm/v3/pkg/release"
-	"k8s.io/cli-runtime/pkg/genericclioptions"
 
 	v2 "github.com/fluxcd/helm-controller/api/v2"
 	"github.com/fluxcd/helm-controller/internal/action"
@@ -43,7 +40,7 @@ func (l *LogrusAdapter) Fatalf(format string, args ...interface{}) {
 
 type HelmClient interface {
 	GetHelmRelease(ctx context.Context, name, namespace string) (*v2.HelmRelease, error)
-	GetRelease(name string) (*helmrelease.Release, error)
+	GetRelease(name, storageNamespace string) (*helmrelease.Release, error)
 	DiffRelease(ctx context.Context, release *helmrelease.Release, controller string, ignoreRules []v2.IgnoreRule) (jsondiff.DiffSet, error)
 }
 
@@ -71,14 +68,9 @@ func NewHelmActionClient(settings *genericclioptions.ConfigFlags, logger Logger)
 	}, nil
 }
 
-func (hc *HelmActionClient) getActionConfig(releaseName string) error {
+func (hc *HelmActionClient) getActionConfig(storageNamespace string) error {
 	if hc.actionConfig != nil {
 		return nil
-	}
-
-	storageNamespace, err := hc.findReleaseStorageNamespace(releaseName)
-	if err != nil {
-		return err
 	}
 
 	hc.actionConfig = new(helmaction.Configuration)
@@ -87,29 +79,6 @@ func (hc *HelmActionClient) getActionConfig(releaseName string) error {
 	}
 
 	return nil
-}
-
-func (hc *HelmActionClient) findReleaseStorageNamespace(releaseName string) (string, error) {
-	namespaces, err := hc.client.CoreV1().Namespaces().List(context.Background(), v1.ListOptions{})
-	if err != nil {
-		return "", fmt.Errorf("failed to list namespaces: %w", err)
-	}
-
-	secretName := fmt.Sprintf("sh.helm.release.v1.%s.v", releaseName)
-
-	for _, ns := range namespaces.Items {
-		secrets, err := hc.client.CoreV1().Secrets(ns.Name).List(context.Background(), v1.ListOptions{})
-		if err != nil {
-			return "", fmt.Errorf("failed to list secrets in namespace %s: %w", ns.Name, err)
-		}
-		for _, secret := range secrets.Items {
-			if strings.HasPrefix(secret.Name, secretName) {
-				return ns.Name, nil
-			}
-		}
-	}
-
-	return "", fmt.Errorf("helm release storage not found for release %s in any namespace", releaseName)
 }
 
 func (hc *HelmActionClient) GetHelmRelease(ctx context.Context, name, namespace string) (*v2.HelmRelease, error) {
@@ -131,8 +100,8 @@ func (hc *HelmActionClient) GetHelmRelease(ctx context.Context, name, namespace 
 	return &helmRelease, nil
 }
 
-func (hc *HelmActionClient) GetRelease(name string) (*helmrelease.Release, error) {
-	if err := hc.getActionConfig(name); err != nil {
+func (hc *HelmActionClient) GetRelease(name, storageNamespace string) (*helmrelease.Release, error) {
+	if err := hc.getActionConfig(storageNamespace); err != nil {
 		return nil, fmt.Errorf("failed to initialize action configuration: %w", err)
 	}
 	return action.LastRelease(hc.actionConfig, name)
@@ -169,7 +138,12 @@ func (h *HelmDriftDetect) Run(ctx context.Context, releaseName, namespace string
 		releaseName = helmRelease.Spec.ReleaseName
 	}
 
-	release, err := h.HelmClient.GetRelease(releaseName)
+	storageNamespace := namespace
+	if helmRelease.Spec.StorageNamespace != "" {
+		storageNamespace = helmRelease.Spec.StorageNamespace
+	}
+
+	release, err := h.HelmClient.GetRelease(releaseName, storageNamespace)
 	if err != nil {
 		return fmt.Errorf("failed to get Helm release %s: %w", releaseName, err)
 	}
@@ -237,10 +211,9 @@ func main() {
 		logger.Fatalf("Failed to initialize Helm client: %v\n", err)
 	}
 
-	helmDriftDetect := NewHelmDriftDetect(log.StandardLogger(), helmClient)
+	helmDriftDetect := NewHelmDriftDetect(logger, helmClient)
 
 	if err := helmDriftDetect.Run(context.Background(), releaseName, namespace); err != nil {
 		logger.Fatalf("Application error: %v\n", err)
 	}
 }
-
